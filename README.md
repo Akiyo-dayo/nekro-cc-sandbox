@@ -2,6 +2,18 @@
 
 `nekro-cc-sandbox` 是一个基于 **Claude Code** 的持久化工作区沙盒服务，用于为上层 Agent 系统提供可隔离、可持续、可流式返回的任务执行环境。
 
+## 本 fork 相对上游改了什么
+
+这是 [NekroAI/nekro-cc-sandbox](https://github.com/NekroAI/nekro-cc-sandbox) 的 fork，起点是上游提交 `0508095`（0.1.14），许可证仍是 AGPL-3.0。改动只在镜像构建上，`src/` 下的 Python 代码与上游相同：
+
+- **Claude Code 钉版本**：Dockerfile 里的 `ARG CLAUDE_CODE_VERSION`，当前是 2.1.311（npm 的 stable 通道）。构建时核对 `claude --version`，对不上就失败；镜像里设了 `DISABLE_AUTOUPDATER=1`，CLI 不会在运行中自己升级。
+- **Node.js 20 → 22**：Claude Code 从 2.1.198 起要求 Node ≥ 22，Node 20 也已在 2026-04-30 停止维护。前端构建阶段同样换成 `node:22-alpine`。
+- **其余组件也钉版本**：`agent-browser` 0.23.4、`playwright` 1.58.2（决定 Chromium 版本）、`pnpm` 10.33.0（只用来构建前端）。取的是上游 0.1.14 镜像构建时（2026-03-31）的版本，行为与上游镜像一致。
+- **版本号** `0.1.14+ak1`：`+akN` 是本 fork 的修订号。
+- **发布工作流**（`.github/workflows/publish.yml`）：只构建 linux/amd64，推到 `ghcr.io/akiyo-dayo/nekro-cc-sandbox`。标签形如 `0.1.14-ak1-cc2.1.311`，发布后不覆盖，也不发 `latest`。推送前先启动容器做冒烟检查，只用内置的 `GITHUB_TOKEN`。
+
+升级 Claude Code：改 Dockerfile 里的 `ARG CLAUDE_CODE_VERSION`（其他内容也变了的话，把 `+akN` 加一），提交后手动运行 “Release Docker Image” 工作流，或推送 `v<镜像标签>` 形式的 git 标签。
+
 它适合被用作：
 
 - Claude Code 的 API 化执行后端

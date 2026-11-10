@@ -3,18 +3,29 @@
 # ============================================
 # nekro-cc-sandbox: Claude Code Workspace Agent
 # ============================================
+#
+# Akiyo-dayo fork: every tool that used to float on "latest" is pinned below,
+# so rebuilding the same commit gives the same Claude Code / browser stack.
+# To upgrade, change the ARG default, rebuild, and publish a new image tag.
+#   CLAUDE_CODE_VERSION   Claude Code CLI (npm @anthropic-ai/claude-code)
+#   AGENT_BROWSER_VERSION agent-browser CLI
+#   PLAYWRIGHT_VERSION    playwright (decides the bundled Chromium build)
+#   PNPM_VERSION          pnpm used only to build the frontend
+# The release workflow reads CLAUDE_CODE_VERSION from this file to name the tag.
 
 # ============================================
 # Build stage - Frontend
 # ============================================
-FROM node:20-alpine AS frontend-builder
+FROM node:22-alpine AS frontend-builder
+
+ARG PNPM_VERSION=10.33.0
 
 WORKDIR /app/frontend
 ENV CI=true
 
 # Copy frontend dependency manifests (for better layer caching)
 COPY frontend/package.json frontend/pnpm-lock.yaml ./
-RUN corepack enable && corepack prepare pnpm@latest --activate
+RUN corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate
 
 COPY frontend/ ./
 RUN pnpm install --frozen-lockfile && pnpm run build
@@ -68,10 +79,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     zip \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Node.js 20.x
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+# Install Node.js 22.x (Claude Code >= 2.1.198 declares engines node >= 22)
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && node --version | grep -q '^v22\.'
 
 # Install GitHub CLI (gh)
 RUN mkdir -p /etc/apt/keyrings \
@@ -84,8 +96,16 @@ RUN mkdir -p /etc/apt/keyrings \
     && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Claude Code via npm (avoids bun install.sh which fails on arm64 without package.json)
-RUN npm install -g @anthropic-ai/claude-code
+# Install a pinned Claude Code via npm (avoids bun install.sh which fails on arm64 without package.json).
+# The build fails if the installed CLI does not report exactly this version.
+ARG CLAUDE_CODE_VERSION=2.1.311
+RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+    && installed="$(claude --version | awk '{print $1}')" \
+    && echo "claude --version: ${installed}" \
+    && test "${installed}" = "${CLAUDE_CODE_VERSION}"
+
+# The CLI must never replace itself at runtime: the image tag is the version.
+ENV DISABLE_AUTOUPDATER=1
 
 # Make claude available on PATH for all users (npm global bin is already in PATH,
 # but keep the fallback copy in case of non-standard install paths)
@@ -96,8 +116,10 @@ RUN if [ ! -x /usr/local/bin/claude ] && [ -x /root/.local/bin/claude ]; then \
 # Set shared Playwright browsers path (accessible by all users)
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
 
-# Install agent-browser globally and pre-cache Playwright Chromium to shared path
-RUN npm install -g agent-browser playwright \
+# Install pinned agent-browser / playwright globally and pre-cache Playwright Chromium to shared path
+ARG AGENT_BROWSER_VERSION=0.23.4
+ARG PLAYWRIGHT_VERSION=1.58.2
+RUN npm install -g "agent-browser@${AGENT_BROWSER_VERSION}" "playwright@${PLAYWRIGHT_VERSION}" \
     && mkdir -p /opt/playwright-browsers \
     && playwright install chromium \
     && playwright install-deps chromium \
@@ -135,6 +157,12 @@ ENV PORT=7021
 ENV WORKSPACE_ROOT=/home/appuser/workspaces
 ENV SKIP_PERMISSIONS=false
 ENV DEBUG=false
+
+# Image metadata (the source label also links the GHCR package to this repository)
+LABEL org.opencontainers.image.source="https://github.com/Akiyo-dayo/nekro-cc-sandbox" \
+      org.opencontainers.image.description="nekro-cc-sandbox (Akiyo-dayo fork) with a pinned Claude Code CLI" \
+      org.opencontainers.image.licenses="AGPL-3.0" \
+      io.github.akiyo-dayo.claude-code.version="${CLAUDE_CODE_VERSION}"
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \

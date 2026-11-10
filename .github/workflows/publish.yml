@@ -1,28 +1,29 @@
 name: Release Docker Image
 
+# Akiyo-dayo fork: build linux/amd64 only and push to ghcr.io/akiyo-dayo/nekro-cc-sandbox.
+#
+# Tag = <pyproject version, "+" replaced by "-">-cc<CLAUDE_CODE_VERSION from the Dockerfile>,
+# e.g. 0.1.14-ak1-cc2.1.311. Tags are immutable: the job refuses to push a tag that already
+# exists, and no "latest" tag is published. To release a new Claude Code, change the ARG in the
+# Dockerfile (and bump the "+akN" suffix if anything else changed), then run this workflow
+# manually or push the matching git tag v<image tag>.
+#
+# Only the built-in GITHUB_TOKEN is used; no Docker Hub or other secrets.
+
 on:
+  workflow_dispatch:
   push:
     tags:
-      - 'v*.*.*'
-  workflow_dispatch:
+      - 'v*-cc*'
 
 permissions:
   contents: read
   packages: write
 
-jobs:
-  setup-version:
-    runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.get_version.outputs.version }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Get Version
-        id: get_version
-        run: |
-          VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+env:
+  IMAGE: ghcr.io/akiyo-dayo/nekro-cc-sandbox
 
+jobs:
   test:
     name: Lint & Tests
     runs-on: ubuntu-latest
@@ -51,84 +52,40 @@ jobs:
         run: uv run pytest tests/integration -v --tb=short
 
   build:
-    name: Build (${{ matrix.platform }})
-    needs: [setup-version, test]
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux/amd64
-            runner: ubuntu-latest
-          - platform: linux/arm64
-            runner: ubuntu-24.04-arm
+    name: Build, smoke test and push (linux/amd64)
+    needs: test
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Prepare platform slug
-        id: prep
-        run: echo "slug=${PLATFORM//\//-}" >> $GITHUB_OUTPUT
-        env:
-          PLATFORM: ${{ matrix.platform }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-
-      - name: Build and push by digest
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          platforms: ${{ matrix.platform }}
-          outputs: type=image,name=kromiose/nekro-cc-sandbox,push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=${{ steps.prep.outputs.slug }}
-          cache-to: type=gha,mode=max,scope=${{ steps.prep.outputs.slug }}
-
-      - name: Export digest
+      - name: Compute image tag
+        id: meta
         run: |
-          mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
-
-      - name: Upload digest
-        uses: actions/upload-artifact@v4
-        with:
-          name: digests-${{ steps.prep.outputs.slug }}
-          path: /tmp/digests/*
-          if-no-files-found: error
-          retention-days: 1
-
-  merge:
-    name: Merge & Push Multi-arch Manifest
-    needs: [setup-version, build]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download digests
-        uses: actions/download-artifact@v4
-        with:
-          path: /tmp/digests
-          pattern: digests-*
-          merge-multiple: true
-
-      - name: Get lowercase repository owner
-        id: repo
-        run: echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+          VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          arg() { sed -n "s/^ARG $1=\([0-9][0-9.]*\)\$/\1/p" Dockerfile; }
+          CC=$(arg CLAUDE_CODE_VERSION)
+          AB=$(arg AGENT_BROWSER_VERSION)
+          PW=$(arg PLAYWRIGHT_VERSION)
+          if [ -z "${CC}" ] || [ -z "${AB}" ] || [ -z "${PW}" ]; then
+            echo "Cannot read the pinned versions (ARG CLAUDE_CODE_VERSION / AGENT_BROWSER_VERSION / PLAYWRIGHT_VERSION) from Dockerfile" >&2
+            exit 1
+          fi
+          TAG="${VERSION//+/-}-cc${CC}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "v${TAG}" ]; then
+            echo "git tag ${GITHUB_REF_NAME} does not match the computed image tag v${TAG}" >&2
+            exit 1
+          fi
+          echo "Image: ${IMAGE}:${TAG}"
+          {
+            echo "tag=${TAG}"
+            echo "version=${VERSION}"
+            echo "cc=${CC}"
+            echo "ab=${AB}"
+            echo "pw=${PW}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
@@ -137,25 +94,70 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create and push multi-arch manifest (Docker Hub)
-        working-directory: /tmp/digests
+      - name: Refuse to overwrite an existing tag
         run: |
-          VERSION=${{ needs.setup-version.outputs.version }}
-          docker buildx imagetools create \
-            --tag kromiose/nekro-cc-sandbox:${VERSION} \
-            --tag kromiose/nekro-cc-sandbox:latest \
-            $(printf 'kromiose/nekro-cc-sandbox@sha256:%s ' *)
+          if docker buildx imagetools inspect "${IMAGE}:${{ steps.meta.outputs.tag }}" >/dev/null 2>&1; then
+            echo "${IMAGE}:${{ steps.meta.outputs.tag }} already exists; tags are immutable, bump the version instead" >&2
+            exit 1
+          fi
 
-      - name: Copy manifest to GHCR
+      # No build cache on purpose: releases are rare, and a fresh build picks up base-image
+      # security updates. Everything that matters for behaviour is pinned in the Dockerfile.
+      - name: Build (load into local docker)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Smoke test
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          CC: ${{ steps.meta.outputs.cc }}
+          AB: ${{ steps.meta.outputs.ab }}
+          PW: ${{ steps.meta.outputs.pw }}
         run: |
-          VERSION=${{ needs.setup-version.outputs.version }}
-          OWNER=${{ steps.repo.outputs.owner }}
-          docker buildx imagetools create \
-            --tag ghcr.io/${OWNER}/nekro-cc-sandbox:${VERSION} \
-            --tag ghcr.io/${OWNER}/nekro-cc-sandbox:latest \
-            kromiose/nekro-cc-sandbox:latest
+          set -euo pipefail
+          docker run -d --name smoke -p 7021:7021 -e INTERNAL_API_TOKEN=smoke "${IMAGE}:${TAG}"
+          trap 'docker logs smoke 2>&1 | tail -n 50; docker rm -f smoke >/dev/null' EXIT
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:7021/health >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          curl -fsS http://localhost:7021/health
+          echo
+          STATUS=$(curl -fsS -H "Authorization: Bearer smoke" http://localhost:7021/api/v1/status)
+          echo "${STATUS}"
+          # the service probes `claude --version` at startup: "<version> (Claude Code)"
+          echo "${STATUS}" | jq -e --arg cc "${CC}" '.claude_version | startswith($cc + " ")' >/dev/null
+          docker exec smoke node --version | grep -q '^v22\.'
+          docker exec smoke sh -c 'test "${DISABLE_AUTOUPDATER}" = 1'
+          GLOBALS=$(docker exec smoke npm ls -g --depth=0)
+          echo "${GLOBALS}"
+          echo "${GLOBALS}" | grep -qF "@anthropic-ai/claude-code@${CC}"
+          echo "${GLOBALS}" | grep -qF "agent-browser@${AB}"
+          echo "${GLOBALS}" | grep -qF "playwright@${PW}"
+
+      - name: Push
+        run: docker push "${IMAGE}:${{ steps.meta.outputs.tag }}"
+
+      - name: Summary
+        run: |
+          DIGEST=$(docker image inspect --format '{{index .RepoDigests 0}}' "${IMAGE}:${{ steps.meta.outputs.tag }}" || echo "(see push log)")
+          {
+            echo "### Published"
+            echo ""
+            echo "- Image: \`${IMAGE}:${{ steps.meta.outputs.tag }}\`"
+            echo "- Digest: \`${DIGEST}\`"
+            echo "- Claude Code: \`${{ steps.meta.outputs.cc }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Docker Logout
-        run: |
-          docker logout
-          docker logout ghcr.io
+        if: always()
+        run: docker logout ghcr.io

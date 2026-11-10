@@ -1,6 +1,6 @@
 [project]
 name = "nekro-cc-sandbox"
-version = "0.1.14"
+version = "0.1.14+ak1"
 description = "A Persistent Workspace Agent powered by Claude Code"
 readme = "README.md"
 requires-python = ">=3.13"
