@@ -63,13 +63,19 @@ jobs:
         run: |
           VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
           arg() { sed -n "s/^ARG $1=\([0-9][0-9.]*\)\$/\1/p" Dockerfile; }
+          debarg() { sed -n "s/^ARG $1=\([0-9][0-9A-Za-z.:+~-]*\)\$/\1/p" Dockerfile; }
           CC=$(arg CLAUDE_CODE_VERSION)
           AB=$(arg AGENT_BROWSER_VERSION)
           PW=$(arg PLAYWRIGHT_VERSION)
-          if [ -z "${CC}" ] || [ -z "${AB}" ] || [ -z "${PW}" ]; then
-            echo "Cannot read the pinned versions (ARG CLAUDE_CODE_VERSION / AGENT_BROWSER_VERSION / PLAYWRIGHT_VERSION) from Dockerfile" >&2
-            exit 1
-          fi
+          SSHV=$(debarg OPENSSH_CLIENT_VERSION)
+          RSYNCV=$(debarg RSYNC_VERSION)
+          GITV=$(debarg GIT_VERSION)
+          for v in CC AB PW SSHV RSYNCV GITV; do
+            if [ -z "${!v}" ]; then
+              echo "Cannot read pinned version ${v} from the Dockerfile ARGs" >&2
+              exit 1
+            fi
+          done
           TAG="${VERSION//+/-}-cc${CC}"
           if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "v${TAG}" ]; then
             echo "git tag ${GITHUB_REF_NAME} does not match the computed image tag v${TAG}" >&2
@@ -82,6 +88,9 @@ jobs:
             echo "cc=${CC}"
             echo "ab=${AB}"
             echo "pw=${PW}"
+            echo "sshv=${SSHV}"
+            echo "rsyncv=${RSYNCV}"
+            echo "gitv=${GITV}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
@@ -122,6 +131,9 @@ jobs:
           CC: ${{ steps.meta.outputs.cc }}
           AB: ${{ steps.meta.outputs.ab }}
           PW: ${{ steps.meta.outputs.pw }}
+          SSHV: ${{ steps.meta.outputs.sshv }}
+          RSYNCV: ${{ steps.meta.outputs.rsyncv }}
+          GITV: ${{ steps.meta.outputs.gitv }}
         run: |
           set -euo pipefail
           docker run -d --name smoke -p 7021:7021 -e INTERNAL_API_TOKEN=smoke "${IMAGE}:${TAG}"
@@ -143,6 +155,38 @@ jobs:
           echo "${GLOBALS}" | grep -qF "@anthropic-ai/claude-code@${CC}"
           echo "${GLOBALS}" | grep -qF "agent-browser@${AB}"
           echo "${GLOBALS}" | grep -qF "playwright@${PW}"
+
+          # Debian packages at the pinned versions
+          for pair in "openssh-client=${SSHV}" "rsync=${RSYNCV}" "git=${GITV}"; do
+            pkg="${pair%%=*}"; want="${pair#*=}"
+            got=$(docker exec smoke dpkg-query -W -f='${Version}' "${pkg}")
+            echo "${pkg}: ${got}"
+            test "${got}" = "${want}"
+          done
+          docker exec smoke ssh -V
+          docker exec smoke rsync --version | head -n 1
+          docker exec smoke git --version
+
+          # SSH client config hook: /etc/ssh/ssh_config.d/50-nekro.conf includes
+          # /home/appuser/.claude/nk-ssh/config. Everything below runs as appuser, like Claude Code.
+          docker exec smoke id appuser
+          docker exec smoke cat /etc/ssh/ssh_config.d/50-nekro.conf
+          # (1) include target missing: ssh -G must succeed with nothing on stderr
+          docker exec -u appuser smoke test ! -e /home/appuser/.claude/nk-ssh/config
+          docker exec -u appuser smoke ssh -G nk-any >/dev/null 2>/tmp/ssh-missing.err
+          cat /tmp/ssh-missing.err
+          test ! -s /tmp/ssh-missing.err
+          docker exec -u appuser smoke ssh -vvv -G nk-any 2>&1 >/dev/null | grep -E '50-nekro|nk-ssh' || true
+          # (2) include target present (appuser-owned, 0600): its Host block is applied
+          docker exec -u appuser smoke sh -c 'mkdir -p ~/.claude/nk-ssh && printf "Host nk-probe\n  HostName 192.0.2.10\n  User nkprobe\n" > ~/.claude/nk-ssh/config && chmod 600 ~/.claude/nk-ssh/config'
+          docker exec -u appuser smoke ssh -G nk-probe | grep -qx 'hostname 192.0.2.10'
+          docker exec -u appuser smoke ssh -G nk-probe | grep -qx 'user nkprobe'
+          # (3) informational, does not fail the build: other owners/modes a host-side writer may produce
+          docker exec smoke sh -c 'chown root:root /home/appuser/.claude/nk-ssh/config && chmod 644 /home/appuser/.claude/nk-ssh/config'
+          echo "root:root 0644 ->"; docker exec -u appuser smoke ssh -G nk-probe 2>&1 | grep -E '^hostname|Bad owner|error' || true
+          docker exec smoke chmod 666 /home/appuser/.claude/nk-ssh/config
+          echo "root:root 0666 ->"; docker exec -u appuser smoke ssh -G nk-probe 2>&1 | grep -E '^hostname|Bad owner|error' || true
+          docker exec smoke rm -rf /home/appuser/.claude/nk-ssh
 
       - name: Push
         run: docker push "${IMAGE}:${{ steps.meta.outputs.tag }}"

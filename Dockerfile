@@ -11,7 +11,16 @@
 #   AGENT_BROWSER_VERSION agent-browser CLI
 #   PLAYWRIGHT_VERSION    playwright (decides the bundled Chromium build)
 #   PNPM_VERSION          pnpm used only to build the frontend
+#   OPENSSH_CLIENT_VERSION / RSYNC_VERSION / GIT_VERSION
+#                         exact Debian trixie package versions (apt "pkg=version")
 # The release workflow reads CLAUDE_CODE_VERSION from this file to name the tag.
+#
+# Debian package pins: the base image is pinned to the trixie release, and the three
+# tools an SSH gateway relies on are pinned to exact versions. Debian only keeps the newest
+# version of a package in each suite, so after a Debian security update the old version
+# disappears and the build fails on purpose: look up the new version (e.g.
+# https://qa.debian.org/madison.php?package=rsync&s=trixie,trixie-security), update the ARG,
+# and publish a new image tag.
 
 # ============================================
 # Build stage - Frontend
@@ -35,7 +44,7 @@ RUN pnpm install --frozen-lockfile && pnpm run build
 # ============================================
 FROM ghcr.io/astral-sh/uv:0.5 AS uv-bin
 
-FROM python:3.13-slim AS deps-builder
+FROM python:3.13-slim-trixie AS deps-builder
 
 WORKDIR /app
 
@@ -55,7 +64,7 @@ RUN uv sync --no-dev --frozen
 # ============================================
 # Runtime stage
 # ============================================
-FROM python:3.13-slim AS runtime
+FROM python:3.13-slim-trixie AS runtime
 
 # Install uv
 COPY --from=uv-bin /uv /usr/local/bin/uv
@@ -69,15 +78,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     gnupg \
-    git \
     jq \
-    openssh-client \
     procps \
     unzip \
     util-linux \
     wget \
     zip \
     && rm -rf /var/lib/apt/lists/*
+
+# ssh / rsync / git at exact versions (see the note at the top about Debian pins).
+# Installed right after the base layer so nothing later pulls in an unpinned copy.
+ARG OPENSSH_CLIENT_VERSION=1:10.0p1-7+deb13u4
+ARG RSYNC_VERSION=3.5.0+ds1-0+deb13u1
+ARG GIT_VERSION=1:2.47.3-0+deb13u1
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    "openssh-client=${OPENSSH_CLIENT_VERSION}" \
+    "rsync=${RSYNC_VERSION}" \
+    "git=${GIT_VERSION}" \
+    && rm -rf /var/lib/apt/lists/*
+
+# Let the host application drop SSH client config (e.g. a gateway) into the per-workspace
+# ~/.claude volume. Debian's /etc/ssh/ssh_config includes ssh_config.d/*.conf; an Include
+# whose target does not exist is ignored by ssh, so this is a no-op until the file appears.
+RUN grep -q '^Include /etc/ssh/ssh_config.d/\*.conf' /etc/ssh/ssh_config \
+    && printf '%s\n' 'Include /home/appuser/.claude/nk-ssh/config' > /etc/ssh/ssh_config.d/50-nekro.conf \
+    && chmod 644 /etc/ssh/ssh_config.d/50-nekro.conf
 
 # Install Node.js 22.x (Claude Code >= 2.1.198 declares engines node >= 22)
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \

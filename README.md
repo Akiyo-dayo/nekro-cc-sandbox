@@ -9,9 +9,11 @@
 - **Claude Code 钉版本**：Dockerfile 里的 `ARG CLAUDE_CODE_VERSION`，当前是 2.1.311（npm 的 stable 通道）。构建时核对 `claude --version`，对不上就失败；镜像里设了 `DISABLE_AUTOUPDATER=1`，CLI 不会在运行中自己升级。
 - **Node.js 20 → 22**：Claude Code 从 2.1.198 起要求 Node ≥ 22，Node 20 也已在 2026-04-30 停止维护。前端构建阶段同样换成 `node:22-alpine`。
 - **其余组件也钉版本**：`agent-browser` 0.23.4、`playwright` 1.58.2（决定 Chromium 版本）、`pnpm` 10.33.0（只用来构建前端）。取的是上游 0.1.14 镜像构建时（2026-03-31）的版本，行为与上游镜像一致。
-- **版本号** `0.1.14+ak1`：`+akN` 是本 fork 的修订号。
+- **Debian 包钉版本**（ak2 起）：基础镜像固定在 `python:3.13-slim-trixie`；`openssh-client`、`rsync`、`git` 钉到具体版本，见 Dockerfile 里的 `OPENSSH_CLIENT_VERSION` / `RSYNC_VERSION` / `GIT_VERSION`。`rsync` 是新增的。Debian 每个源里只保留最新版，所以出了安全更新以后，旧版本会从源里消失，构建会失败。这是故意的：查到新版本号，改掉 ARG，再发新标签。
+- **SSH 客户端配置挂点**（ak2 起）：`/etc/ssh/ssh_config.d/50-nekro.conf` 只有一行 `Include /home/appuser/.claude/nk-ssh/config`。上层应用（例如 Nekro Agent）可以往每个工作区的 `~/.claude/nk-ssh/config` 写 SSH 客户端配置；文件不存在时 ssh 照常工作。注意 OpenSSH 会检查被 Include 文件的属主和权限：属主必须是 root 或运行 ssh 的用户（`appuser`），而且不能对组或其他人可写，否则 ssh 直接报 `Bad owner or permissions`。
+- **版本号** `0.1.14+ak2`：`+akN` 是本 fork 的修订号（ak1 是第一版：Claude Code、Node、npm 组件钉版本）。
 - **测试工作流**（`.github/workflows/test.yml`）：e2e 任务的 Node 换成 22，pnpm 钉在 10.33.0。原来用的 `latest`（11 以上）装这份锁文件会报 `ERR_PNPM_IGNORED_BUILDS`。
-- **发布工作流**（`.github/workflows/publish.yml`）：只构建 linux/amd64，推到 `ghcr.io/akiyo-dayo/nekro-cc-sandbox`。标签形如 `0.1.14-ak1-cc2.1.311`，发布后不覆盖，也不发 `latest`。推送前先启动容器做冒烟检查，只用内置的 `GITHUB_TOKEN`。
+- **发布工作流**（`.github/workflows/publish.yml`）：只构建 linux/amd64，推到 `ghcr.io/akiyo-dayo/nekro-cc-sandbox`。标签形如 `0.1.14-ak2-cc2.1.311`，发布后不覆盖，也不发 `latest`。推送前先启动容器做冒烟检查，检查各组件版本和 SSH 配置挂点；只用内置的 `GITHUB_TOKEN`。
 
 升级 Claude Code：改 Dockerfile 里的 `ARG CLAUDE_CODE_VERSION`（其他内容也变了的话，把 `+akN` 加一），提交后手动运行 “Release Docker Image” 工作流，或推送 `v<镜像标签>` 形式的 git 标签。
 
