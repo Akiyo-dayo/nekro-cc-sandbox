@@ -173,11 +173,17 @@ jobs:
           # /home/appuser/.claude/nk-ssh/config. Everything below runs as appuser, like Claude Code.
           docker exec smoke id appuser
           docker exec smoke cat /etc/ssh/ssh_config.d/50-nekro.conf
-          # (1) include target missing: ssh -G must succeed with nothing on stderr
+          # (1) include target missing: ssh -G must succeed without errors. Without a terminal on
+          # stdin (docker exec without -t, or Claude Code's Bash tool) ssh itself notes
+          # "Pseudo-terminal will not be allocated because stdin is not a terminal." -- that line is
+          # unrelated to the config and is the only stderr output allowed; with -T stderr must be empty.
           docker exec -u appuser smoke test ! -e /home/appuser/.claude/nk-ssh/config
           docker exec -u appuser smoke ssh -G nk-any >/dev/null 2>/tmp/ssh-missing.err
           cat /tmp/ssh-missing.err
-          test ! -s /tmp/ssh-missing.err
+          test -z "$(grep -v '^Pseudo-terminal will not be allocated because stdin is not a terminal' /tmp/ssh-missing.err || true)"
+          docker exec -u appuser smoke ssh -T -G nk-any >/dev/null 2>/tmp/ssh-missing-T.err
+          cat /tmp/ssh-missing-T.err
+          test ! -s /tmp/ssh-missing-T.err
           VERBOSE=$(docker exec -u appuser smoke ssh -vvv -G nk-any 2>&1 >/dev/null || true)
           grep -E '50-nekro|nk-ssh' <<<"${VERBOSE}" || true
           # (2) include target present (appuser-owned, 0600): its Host block is applied
