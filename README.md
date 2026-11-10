@@ -10,6 +10,7 @@
 - **Node.js 20 → 22**：Claude Code 从 2.1.198 起要求 Node ≥ 22，Node 20 也已在 2026-04-30 停止维护。前端构建阶段同样换成 `node:22-alpine`。
 - **其余组件也钉版本**：`agent-browser` 0.23.4、`playwright` 1.58.2（决定 Chromium 版本）、`pnpm` 10.33.0（只用来构建前端）。取的是上游 0.1.14 镜像构建时（2026-03-31）的版本，行为与上游镜像一致。
 - **版本号** `0.1.14+ak1`：`+akN` 是本 fork 的修订号。
+- **测试工作流**（`.github/workflows/test.yml`）：e2e 任务的 Node 换成 22，pnpm 钉在 10.33.0。原来用的 `latest`（11 以上）装这份锁文件会报 `ERR_PNPM_IGNORED_BUILDS`。
 - **发布工作流**（`.github/workflows/publish.yml`）：只构建 linux/amd64，推到 `ghcr.io/akiyo-dayo/nekro-cc-sandbox`。标签形如 `0.1.14-ak1-cc2.1.311`，发布后不覆盖，也不发 `latest`。推送前先启动容器做冒烟检查，只用内置的 `GITHUB_TOKEN`。
 
 升级 Claude Code：改 Dockerfile 里的 `ARG CLAUDE_CODE_VERSION`（其他内容也变了的话，把 `+akN` 加一），提交后手动运行 “Release Docker Image” 工作流，或推送 `v<镜像标签>` 形式的 git 标签。
