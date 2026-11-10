@@ -134,6 +134,8 @@ jobs:
           SSHV: ${{ steps.meta.outputs.sshv }}
           RSYNCV: ${{ steps.meta.outputs.rsyncv }}
           GITV: ${{ steps.meta.outputs.gitv }}
+        # pipefail is on: never pipe into an early-exiting reader (head, grep -q), the writer would
+        # die of SIGPIPE (exit 141). Capture output first and match with here-strings instead.
         run: |
           set -euo pipefail
           docker run -d --name smoke -p 7021:7021 -e INTERNAL_API_TOKEN=smoke "${IMAGE}:${TAG}"
@@ -148,13 +150,13 @@ jobs:
           echo "${STATUS}"
           # the service probes `claude --version` at startup: "<version> (Claude Code)"
           echo "${STATUS}" | jq -e --arg cc "${CC}" '.claude_version | startswith($cc + " ")' >/dev/null
-          docker exec smoke node --version | grep -q '^v22\.'
+          grep -q '^v22\.' <<<"$(docker exec smoke node --version)"
           docker exec smoke sh -c 'test "${DISABLE_AUTOUPDATER}" = 1'
           GLOBALS=$(docker exec smoke npm ls -g --depth=0)
           echo "${GLOBALS}"
-          echo "${GLOBALS}" | grep -qF "@anthropic-ai/claude-code@${CC}"
-          echo "${GLOBALS}" | grep -qF "agent-browser@${AB}"
-          echo "${GLOBALS}" | grep -qF "playwright@${PW}"
+          grep -qF "@anthropic-ai/claude-code@${CC}" <<<"${GLOBALS}"
+          grep -qF "agent-browser@${AB}" <<<"${GLOBALS}"
+          grep -qF "playwright@${PW}" <<<"${GLOBALS}"
 
           # Debian packages at the pinned versions
           for pair in "openssh-client=${SSHV}" "rsync=${RSYNCV}" "git=${GITV}"; do
@@ -164,7 +166,7 @@ jobs:
             test "${got}" = "${want}"
           done
           docker exec smoke ssh -V
-          docker exec smoke rsync --version | head -n 1
+          docker exec smoke sh -c 'rsync --version | head -n 1'
           docker exec smoke git --version
 
           # SSH client config hook: /etc/ssh/ssh_config.d/50-nekro.conf includes
@@ -176,16 +178,20 @@ jobs:
           docker exec -u appuser smoke ssh -G nk-any >/dev/null 2>/tmp/ssh-missing.err
           cat /tmp/ssh-missing.err
           test ! -s /tmp/ssh-missing.err
-          docker exec -u appuser smoke ssh -vvv -G nk-any 2>&1 >/dev/null | grep -E '50-nekro|nk-ssh' || true
+          VERBOSE=$(docker exec -u appuser smoke ssh -vvv -G nk-any 2>&1 >/dev/null || true)
+          grep -E '50-nekro|nk-ssh' <<<"${VERBOSE}" || true
           # (2) include target present (appuser-owned, 0600): its Host block is applied
           docker exec -u appuser smoke sh -c 'mkdir -p ~/.claude/nk-ssh && printf "Host nk-probe\n  HostName 192.0.2.10\n  User nkprobe\n" > ~/.claude/nk-ssh/config && chmod 600 ~/.claude/nk-ssh/config'
-          docker exec -u appuser smoke ssh -G nk-probe | grep -qx 'hostname 192.0.2.10'
-          docker exec -u appuser smoke ssh -G nk-probe | grep -qx 'user nkprobe'
+          PROBE=$(docker exec -u appuser smoke ssh -G nk-probe)
+          grep -qx 'hostname 192.0.2.10' <<<"${PROBE}"
+          grep -qx 'user nkprobe' <<<"${PROBE}"
           # (3) informational, does not fail the build: other owners/modes a host-side writer may produce
           docker exec smoke sh -c 'chown root:root /home/appuser/.claude/nk-ssh/config && chmod 644 /home/appuser/.claude/nk-ssh/config'
-          echo "root:root 0644 ->"; docker exec -u appuser smoke ssh -G nk-probe 2>&1 | grep -E '^hostname|Bad owner|error' || true
+          OUT=$(docker exec -u appuser smoke ssh -G nk-probe 2>&1 || true)
+          echo "root:root 0644 ->"; grep -E '^hostname|Bad owner|error' <<<"${OUT}" || true
           docker exec smoke chmod 666 /home/appuser/.claude/nk-ssh/config
-          echo "root:root 0666 ->"; docker exec -u appuser smoke ssh -G nk-probe 2>&1 | grep -E '^hostname|Bad owner|error' || true
+          OUT=$(docker exec -u appuser smoke ssh -G nk-probe 2>&1 || true)
+          echo "root:root 0666 ->"; grep -E '^hostname|Bad owner|error' <<<"${OUT}" || true
           docker exec smoke rm -rf /home/appuser/.claude/nk-ssh
 
       - name: Push
