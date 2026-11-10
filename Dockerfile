@@ -11,7 +11,7 @@
 #   AGENT_BROWSER_VERSION agent-browser CLI
 #   PLAYWRIGHT_VERSION    playwright (decides the bundled Chromium build)
 #   PNPM_VERSION          pnpm used only to build the frontend
-#   OPENSSH_CLIENT_VERSION / RSYNC_VERSION / GIT_VERSION
+#   OPENSSH_CLIENT_VERSION / RSYNC_VERSION / GIT_VERSION / TINI_VERSION
 #                         exact Debian trixie package versions (apt "pkg=version")
 # The release workflow reads CLAUDE_CODE_VERSION from this file to name the tag.
 #
@@ -86,15 +86,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     zip \
     && rm -rf /var/lib/apt/lists/*
 
-# ssh / rsync / git at exact versions (see the note at the top about Debian pins).
+# ssh / rsync / git / tini at exact versions (see the note at the top about Debian pins).
 # Installed right after the base layer so nothing later pulls in an unpinned copy.
+# tini is PID 1 (see ENTRYPOINT): the entrypoint ends in `runuser`, which only waits for its
+# own child, so processes orphaned when a task's process group is SIGKILLed (e.g. `claude`
+# after `script` dies on force-cancel) would otherwise stay as zombies forever.
 ARG OPENSSH_CLIENT_VERSION=1:10.0p1-7+deb13u4
 ARG RSYNC_VERSION=3.5.0+ds1-0+deb13u1
 ARG GIT_VERSION=1:2.47.3-0+deb13u1
+ARG TINI_VERSION=0.19.0-3+b8
 RUN apt-get update && apt-get install -y --no-install-recommends \
     "openssh-client=${OPENSSH_CLIENT_VERSION}" \
     "rsync=${RSYNC_VERSION}" \
     "git=${GIT_VERSION}" \
+    "tini=${TINI_VERSION}" \
     && rm -rf /var/lib/apt/lists/*
 
 # Let the host application drop SSH client config (e.g. a gateway) into the per-workspace
@@ -196,5 +201,6 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 # Expose port
 EXPOSE 7021
 
-# Entrypoint
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+# Entrypoint: tini reaps orphaned processes and forwards signals to the entrypoint.
+# -s also makes it a child subreaper, so reaping still works if a runtime adds its own init.
+ENTRYPOINT ["/usr/bin/tini", "-s", "--", "/usr/local/bin/docker-entrypoint.sh"]
