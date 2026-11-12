@@ -125,6 +125,103 @@ if "--" in args:
     if idx + 1 < len(args):
         prompt = args[idx + 1]
 
+call_log = os.getenv("MOCK_CLAUDE_CALL_LOG")
+if call_log:
+    with open(call_log, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"resume": resume_id}) + "\\n")
+
+def bump_counter():
+    state = os.getenv("MOCK_CLAUDE_STATE")
+    if not state:
+        return 0
+    try:
+        with open(state, encoding="utf-8") as fh:
+            count = int(fh.read() or "0")
+    except FileNotFoundError:
+        count = 0
+    with open(state, "w", encoding="utf-8") as fh:
+        fh.write(str(count + 1))
+    return count
+
+def emit_empty_success(sid):
+    # What Claude Code 2.1.x prints when it resumes a session cut off mid tool call:
+    # a "success" result with 0 tokens and no text, without calling the model.
+    emit({"type": "system", "subtype": "init", "tools": ["Read", "Write", "Bash"]})
+    emit({"type": "system", "subtype": "status"})
+    emit({
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": "",
+        "session_id": sid,
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+    })
+
+empty_now = (
+    (scenario == "empty-on-resume-once" and resume_id and bump_counter() == 0)
+    or (scenario == "empty-on-resume-always" and resume_id)
+    or scenario == "empty-always"
+)
+if empty_now:
+    emit_empty_success(resume_id or session_id)
+    sys.exit(0)
+
+if scenario == "empty-then-answer" and resume_id:
+    # Real Claude Code after a force-cancel killed a background task: it answers the "task stopped"
+    # notification with a synthetic turn and an empty "success" result, then answers the new prompt
+    # in the same process.
+    emit({"type": "system", "subtype": "init", "tools": ["Read", "Write", "Bash"]})
+    emit({"type": "assistant", "message": {
+        "model": "<synthetic>",
+        "content": [{"type": "text", "text": "No response requested."}],
+    }})
+    emit({
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": "",
+        "session_id": resume_id,
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+    })
+    emit({
+        "type": "stream_event",
+        "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Hello world"}},
+    })
+    emit({
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": "Hello world",
+        "session_id": session_id,
+        "usage": {"input_tokens": 10, "output_tokens": 2},
+    })
+    sys.exit(0)
+
+if scenario == "empty-then-silence" and resume_id and bump_counter() == 0:
+    # Empty result, then the process stays quiet for a while before exiting without more output.
+    import time
+    emit_empty_success(resume_id)
+    time.sleep(float(os.getenv("MOCK_CLAUDE_SILENCE", "3")))
+    sys.exit(0)
+
+if scenario == "empty-after-tool" and resume_id:
+    emit({"type": "system", "subtype": "init", "tools": ["Read", "Write", "Bash"]})
+    emit({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "true"}},
+    ]}})
+    emit({"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "toolu_1", "content": "", "is_error": False},
+    ]}})
+    emit({
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": "",
+        "session_id": resume_id,
+        "usage": {"input_tokens": 5, "output_tokens": 0},
+    })
+    sys.exit(0)
+
 if scenario == "no-output":
     sys.exit(0)
 

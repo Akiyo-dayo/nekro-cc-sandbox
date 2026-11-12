@@ -141,8 +141,18 @@ jobs:
         # die of SIGPIPE (exit 141). Capture output first and match with here-strings instead.
         run: |
           set -euo pipefail
-          docker run -d --name smoke -p 7021:7021 -e INTERNAL_API_TOKEN=smoke "${IMAGE}:${TAG}"
-          trap 'docker logs smoke 2>&1 | tail -n 50; docker rm -f smoke >/dev/null' EXIT
+          # A stub Anthropic API (.github/smoke/fake_anthropic.py) on a private network lets a real
+          # Claude Code run a task without any model or credentials (see the force-cancel check).
+          docker network create smoke-net >/dev/null
+          docker run -d --name fakeapi --network smoke-net --user 65534:65534 \
+            -v "${GITHUB_WORKSPACE}/.github/smoke:/smoke:ro" --entrypoint python \
+            "${IMAGE}:${TAG}" /smoke/fake_anthropic.py 8080
+          docker run -d --name smoke --network smoke-net -p 7021:7021 \
+            -e INTERNAL_API_TOKEN=smoke -e SKIP_PERMISSIONS=true \
+            -e SETTINGS_PATH=/home/appuser/data/settings.json \
+            -e CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+            "${IMAGE}:${TAG}"
+          trap 'docker logs smoke 2>&1 | tail -n 80; echo "--- fakeapi"; docker logs fakeapi 2>&1 | tail -n 40; docker rm -f smoke fakeapi >/dev/null; docker network rm smoke-net >/dev/null' EXIT
           for i in $(seq 1 30); do
             if curl -fsS http://localhost:7021/health >/dev/null 2>&1; then break; fi
             sleep 2
@@ -202,6 +212,61 @@ jobs:
           OUT=$(docker exec -u appuser smoke ssh -G nk-probe 2>&1 || true)
           echo "root:root 0666 ->"; grep -E '^hostname|Bad owner|error' <<<"${OUT}" || true
           docker exec smoke rm -rf /home/appuser/.claude/nk-ssh
+
+          # Force-cancel, then the very next message must be answered. When the cancel kills a
+          # background Bash task, the next resume makes Claude Code first answer the "task stopped"
+          # notification with a synthetic turn and an empty "success" result, and only then the new
+          # prompt; the runtime has to read past the empty result. The stub reproduces that: the
+          # SMOKE-INTERRUPT prompt makes the CLI start `sleep 300` in the background, the follow-up
+          # model request is held open, and the task is cancelled while it hangs. A warm-up message
+          # comes first so the cancelled turn is itself a resume of an existing session.
+          docker exec -i -u appuser smoke sh -c 'mkdir -p ~/data && cat > ~/data/settings.json' <<'JSON'
+          {"provider": "anthropic", "active_provider": "anthropic", "timeout_ms": 120000,
+           "providers": {"anthropic": {"name": "stub", "base_url": "http://fakeapi:8080",
+                                       "auth_token": "smoke-token", "model": "claude-sonnet-4-5"}}}
+          JSON
+          WARM=$(curl -fsS -m 300 -H "Authorization: Bearer smoke" -H "Content-Type: application/json" \
+            -d '{"role": "user", "content": "SMOKE-WARMUP say ok", "workspace_id": "default"}' \
+            http://localhost:7021/api/v1/message)
+          echo "warm-up: ${WARM}"
+          jq -e '.success == true and (.session_id | length > 0)' <<<"${WARM}" >/dev/null
+          SID=$(jq -r '.session_id' <<<"${WARM}")
+          curl -sS -m 300 -H "Authorization: Bearer smoke" -H "Content-Type: application/json" \
+            -d '{"role": "user", "content": "SMOKE-INTERRUPT run the command", "workspace_id": "default"}' \
+            http://localhost:7021/api/v1/message >/tmp/first.json 2>&1 &
+          FIRST=$!
+          # Cancel only while the follow-up request hangs and the tool result is in the transcript;
+          # cancelling earlier leaves nothing half-done and the check would pass without testing.
+          READY=no
+          for i in $(seq 1 90); do
+            if grep -qF -- '-> hold' <<<"$(docker logs fakeapi 2>&1)"; then
+              N=$(docker exec -u appuser smoke sh -c "cat ~/.claude/projects/*/${SID}.jsonl 2>/dev/null | grep -c '\"tool_result\"' || true")
+              if [ "${N:-0}" -gt 0 ]; then READY=yes; break; fi
+            fi
+            sleep 1
+          done
+          echo "model request in flight with the tool result persisted: ${READY}"
+          test "${READY}" = yes
+          CANCEL=$(curl -fsS -X DELETE -H "Authorization: Bearer smoke" \
+            http://localhost:7021/api/v1/workspaces/default/queue/current)
+          echo "cancel: ${CANCEL}"
+          jq -e '.cancelled == true' <<<"${CANCEL}" >/dev/null
+          wait "${FIRST}" || true
+          echo "first: $(cat /tmp/first.json)"
+          NEXT=$(curl -fsS -m 300 -H "Authorization: Bearer smoke" -H "Content-Type: application/json" \
+            -d '{"role": "user", "content": "SMOKE-AFTER-CANCEL reply now", "workspace_id": "default"}' \
+            http://localhost:7021/api/v1/message)
+          echo "next: ${NEXT}"
+          jq -e '.success == true and (.message | contains("after-cancel-ok"))' <<<"${NEXT}" >/dev/null
+          # and the empty-result path really was exercised (otherwise this check proves nothing)
+          SBLOG=$(docker logs smoke 2>&1)
+          grep -E 'Empty result at the start of a resumed run|produced nothing|retrying' <<<"${SBLOG}" || true
+          grep -qF 'Empty result at the start of a resumed run' <<<"${SBLOG}"
+
+          # Claude Code's global config lives in the mounted ~/.claude (CLAUDE_CONFIG_DIR), not in $HOME
+          docker exec smoke sh -c 'test "${CLAUDE_CONFIG_DIR}" = /home/appuser/.claude'
+          docker exec smoke test -f /home/appuser/.claude/.claude.json
+          docker exec smoke test ! -e /home/appuser/.claude.json
 
           # Zombie reaping: tini must be PID 1. Orphan a short-lived process the way a force-cancel
           # does (its parent dies first, so it is re-parented to PID 1), let it exit, and require

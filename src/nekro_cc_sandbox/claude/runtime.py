@@ -87,6 +87,38 @@ class ClaudeSession:
     is_active: bool = True
 
 
+# After an empty "success" result at the start of a resumed run, keep reading stdout for the real
+# result, but give up if the CLI prints nothing at all for this long (it may still be waiting for
+# the model, so this is generous; a force-cancel stays available to the caller).
+EMPTY_RESULT_READ_ON_IDLE_SECONDS = 300.0
+
+
+def _is_empty_success_result(
+    *,
+    result_seen_ok: bool,
+    output_tokens: int | None,
+    final_result_text: str | None,
+    last_assistant_text: str | None,
+    cli_error_summary: str | None,
+    tool_activity: bool,
+) -> bool:
+    """A success `result` that carries nothing at all (0 output tokens, no text, no tool activity).
+
+    Claude Code prints exactly this when it resumes a session cut off by a force-cancel (SIGKILL of
+    the whole process group) while a background Bash task was running: it first handles the
+    "background task stopped" notification with a synthetic turn ("No response requested.", model
+    "<synthetic>", no model call) and reports that as a separate, empty "success" result, and only
+    then works on the new prompt and prints a second, real result in the same process. Nothing was
+    shown to the caller before it, so reading on (or retrying) does not duplicate anything.
+    A missing token count is accepted; a positive one is not (the model really answered).
+    """
+    if not result_seen_ok or cli_error_summary or tool_activity:
+        return False
+    if final_result_text or last_assistant_text:
+        return False
+    return output_tokens is None or output_tokens == 0
+
+
 class ClaudeRuntime:
     """
     Manages Claude Code as a Workspace Agent.
@@ -267,9 +299,19 @@ class ClaudeRuntime:
         stdout: asyncio.StreamReader,
         *,
         on_line: Callable[[str, str], None] | None = None,
+        idle_timeout: Callable[[], float | None] | None = None,
     ) -> AsyncGenerator[dict[str, Any]]:
         while True:
-            raw = await stdout.readline()
+            timeout = idle_timeout() if idle_timeout is not None else None
+            if timeout is None:
+                raw = await stdout.readline()
+            else:
+                try:
+                    raw = await asyncio.wait_for(stdout.readline(), timeout=timeout)
+                except TimeoutError:
+                    if on_line is not None:
+                        on_line("", "idle_timeout")
+                    break
             if not raw:
                 break
             decoded = raw.decode("utf-8", errors="replace")
@@ -376,8 +418,15 @@ class ClaudeRuntime:
                         f"resume_id={resume_id!r} workspace={workspace_id}"
                     )
                     attempt_resume_id = resume_id
+                    # Resuming a session cut off by a force-cancel: the CLI first prints an empty
+                    # "success" result for the interrupted turn, then the real one. Within a run we
+                    # read past the empty result (see the result handler). If a resumed run still
+                    # produces nothing at all, retry once with the same session, then once without
+                    # --resume. "No conversation found" on --resume retries once without --resume.
+                    # At most 3 attempts in total.
+                    empty_resume_retried = False
 
-                    for attempt in range(2):
+                    for attempt in range(3):
                         claude_cmd = self._build_claude_cmd(prompt=message, session_id=attempt_resume_id)
                         cmd = self._build_pseudotty_wrapper_cmd(claude_cmd)
                         # 记录实际执行的命令（脱敏 prompt 内容）
@@ -415,6 +464,9 @@ class ClaudeRuntime:
                         tool_calls_seen: list[str] = []
                         yielded_tool_use_ids: set[str] = set()
                         yielded_tool_result_ids: set[str] = set()
+                        result_seen_ok = False
+                        result_output_tokens: int | None = None
+                        read_on_after_empty = False
 
                         stdout_tail: deque[str] = deque(maxlen=30)
                         stdout_skipped_tail: deque[str] = deque(maxlen=30)
@@ -430,7 +482,12 @@ class ClaudeRuntime:
                                 if line:
                                     stdout_skipped_tail.append(line[:500])
 
-                        async for obj in self._iter_stream_json_objects(proc.stdout, on_line=_on_line):
+                        def _idle_timeout() -> float | None:
+                            return EMPTY_RESULT_READ_ON_IDLE_SECONDS if read_on_after_empty else None
+
+                        async for obj in self._iter_stream_json_objects(
+                            proc.stdout, on_line=_on_line, idle_timeout=_idle_timeout
+                        ):
                             parsed_objects += 1
                             obj_type = obj.get("type")
                             if isinstance(obj_type, str):
@@ -456,6 +513,11 @@ class ClaudeRuntime:
                                     self._last_init_tools[workspace_id] = tools
                             elif obj_type == "assistant":
                                 msg = obj.get("message", {})
+                                # Turns the CLI makes up itself (model "<synthetic>", e.g. the
+                                # "No response requested." it writes for a background-task
+                                # notification after a force-cancel) are not the model's answer.
+                                if isinstance(msg, dict) and msg.get("model") == "<synthetic>":
+                                    continue
                                 if isinstance(msg, dict):
                                     content = msg.get("content", [])
                                     if isinstance(content, list):
@@ -523,6 +585,10 @@ class ClaudeRuntime:
                                 usage = obj.get("usage") or {}
                                 in_tok = usage.get("input_tokens", "?")
                                 out_tok = usage.get("output_tokens", "?")
+                                if not is_error:
+                                    result_seen_ok = True
+                                    if isinstance(out_tok, int):
+                                        result_output_tokens = out_tok
                                 _result_len = len(result_text) if isinstance(result_text, str) else 0
                                 _elapsed_result = time.monotonic() - start_time
                                 if not is_error:
@@ -558,6 +624,34 @@ class ClaudeRuntime:
                                         "permission_denials_preview": pd_preview if isinstance(permission_denials, list) else permission_denials,
                                         "errors_preview": preview if cli_errors else None,
                                     }
+                                # Resuming a session whose last turn was cut off mid model request:
+                                # the CLI first reports the interrupted turn as an empty "success"
+                                # result, then answers the new prompt and prints the real result.
+                                # Read on (once) instead of stopping at the empty one.
+                                if (
+                                    attempt_resume_id
+                                    and not read_on_after_empty
+                                    and not yielded_any_text
+                                    and _is_empty_success_result(
+                                        result_seen_ok=result_seen_ok,
+                                        output_tokens=result_output_tokens,
+                                        final_result_text=final_result_text,
+                                        last_assistant_text=last_assistant_text,
+                                        cli_error_summary=cli_error_summary,
+                                        tool_activity=bool(tool_calls_seen or yielded_tool_use_ids or yielded_tool_result_ids),
+                                    )
+                                ):
+                                    read_on_after_empty = True
+                                    result_seen_ok = False
+                                    result_output_tokens = None
+                                    final_result_text = None
+                                    logger.warning(
+                                        "[ClaudeRuntime] Empty result at the start of a resumed run "
+                                        "(the CLI closed a turn cut off by a force-cancel first); "
+                                        "reading on for the real result. "
+                                        f"workspace_id={workspace_id} resume_id={attempt_resume_id!r}"
+                                    )
+                                    continue
                                 # result 是 CLI 的最终输出，后面不会有任何有意义的数据。
                                 # 必须立即 break 跳出 stdout 读取循环，否则 script(1) 伪终端
                                 # wrapper 可能迟迟不关闭 stdout，导致 readline() 无限阻塞，
@@ -674,8 +768,49 @@ class ClaudeRuntime:
                             return
 
                         if not yielded_any_text:
+                            tool_activity = bool(tool_calls_seen or yielded_tool_use_ids or yielded_tool_result_ids)
+                            # Nothing at all came out of this run: either the empty result was the only
+                            # one (the CLI stopped after closing the interrupted turn), or we read on
+                            # after it and the real result never came.
+                            ended_empty = not (
+                                final_result_text or last_assistant_text or cli_error_summary or tool_activity
+                            ) and (
+                                read_on_after_empty
+                                or _is_empty_success_result(
+                                    result_seen_ok=result_seen_ok,
+                                    output_tokens=result_output_tokens,
+                                    final_result_text=final_result_text,
+                                    last_assistant_text=last_assistant_text,
+                                    cli_error_summary=cli_error_summary,
+                                    tool_activity=tool_activity,
+                                )
+                            )
+                            if attempt < 2 and attempt_resume_id and ended_empty:
+                                if not empty_resume_retried:
+                                    empty_resume_retried = True
+                                    # Resume whatever session the CLI reported (it may hand out a new id),
+                                    # exactly like the next message would.
+                                    if session.session_id and self._is_uuid(session.session_id):
+                                        attempt_resume_id = session.session_id
+                                    logger.warning(
+                                        "[ClaudeRuntime] Resumed run produced nothing "
+                                        "(its session was cut off by a force-cancel); "
+                                        "retrying once with the same session. "
+                                        f"workspace_id={workspace_id} resume_id={attempt_resume_id!r}"
+                                    )
+                                    continue
+                                logger.warning(
+                                    "[ClaudeRuntime] Resumed session returned an empty result again; "
+                                    "retrying without --resume. "
+                                    f"workspace_id={workspace_id} resume_id={attempt_resume_id!r}"
+                                )
+                                attempt_resume_id = None
+                                session.session_id = ""
+                                await self.workspace_manager.update_session(workspace_id, "")
+                                continue
+
                             if (
-                                attempt == 0
+                                attempt < 2
                                 and attempt_resume_id
                                 and cli_errors
                                 and any("No conversation found with session ID" in e for e in cli_errors)

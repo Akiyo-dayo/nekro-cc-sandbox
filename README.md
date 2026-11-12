@@ -4,7 +4,7 @@
 
 ## 本 fork 相对上游改了什么
 
-这是 [NekroAI/nekro-cc-sandbox](https://github.com/NekroAI/nekro-cc-sandbox) 的 fork，起点是上游提交 `0508095`（0.1.14），许可证仍是 AGPL-3.0。改动只在镜像构建上，`src/` 下的 Python 代码与上游相同：
+这是 [NekroAI/nekro-cc-sandbox](https://github.com/NekroAI/nekro-cc-sandbox) 的 fork，起点是上游提交 `0508095`（0.1.14），许可证仍是 AGPL-3.0。ak3 及以前的改动只在镜像构建上；ak4 起 `src/` 里改了一处续接重试（见下）：
 
 - **Claude Code 钉版本**：Dockerfile 里的 `ARG CLAUDE_CODE_VERSION`，当前是 2.1.311（npm 的 stable 通道）。构建时核对 `claude --version`，对不上就失败；镜像里设了 `DISABLE_AUTOUPDATER=1`，CLI 不会在运行中自己升级。
 - **Node.js 20 → 22**：Claude Code 从 2.1.198 起要求 Node ≥ 22，Node 20 也已在 2026-04-30 停止维护。前端构建阶段同样换成 `node:22-alpine`。
@@ -12,9 +12,11 @@
 - **Debian 包钉版本**（ak2 起）：基础镜像固定在 `python:3.13-slim-trixie`；`openssh-client`、`rsync`、`git`（ak3 起还有 `tini`）钉到具体版本，见 Dockerfile 里的 `OPENSSH_CLIENT_VERSION` / `RSYNC_VERSION` / `GIT_VERSION` / `TINI_VERSION`。`rsync` 是新增的。Debian 每个源里只保留最新版，所以出了安全更新以后，旧版本会从源里消失，构建会失败。这是故意的：查到新版本号，改掉 ARG，再发新标签。
 - **SSH 客户端配置挂点**（ak2 起）：`/etc/ssh/ssh_config.d/50-nekro.conf` 只有一行 `Include /home/appuser/.claude/nk-ssh/config`。上层应用（例如 Nekro Agent）可以往每个工作区的 `~/.claude/nk-ssh/config` 写 SSH 客户端配置；文件不存在时 ssh 照常工作。注意 OpenSSH 会检查被 Include 文件的属主和权限：属主必须是 root 或运行 ssh 的用户（`appuser`），而且不能对组或其他人可写，否则 ssh 直接报 `Bad owner or permissions`。
 - **tini 当 1 号进程**（ak3 起）：`ENTRYPOINT ["/usr/bin/tini", "-s", "--", "/usr/local/bin/docker-entrypoint.sh"]`，`tini` 钉在 `0.19.0-3+b8`。上游的入口脚本最后一步是 `runuser`，它只等自己的子进程。强制取消任务时，整个进程组被 SIGKILL，`script` 先死，`claude` 就成了挂在 1 号进程名下的孤儿，死后没人回收，变成 `<defunct>` 僵尸，而且越积越多。`-s` 让 tini 同时注册成 subreaper，即使运行时另外加了 init 也照样能回收。
-- **版本号** `0.1.14+ak3`：`+akN` 是本 fork 的修订号。ak1 是第一版，钉住 Claude Code、Node 和 npm 组件的版本；ak2 加了 Debian 包版本钉和 SSH 配置挂点；ak3 加了 tini。
+- **强制取消后的下一条消息不再空返回**（ak4 起，`src/nekro_cc_sandbox/claude/runtime.py`）：强制取消会把整个进程组 SIGKILL，模型在后台跑的 Bash 任务也一起被杀掉。下一条续接时，Claude Code 先处理「后台任务已停止」的通知：本地合成一条「No response requested.」（模型字段是 `<synthetic>`，不调模型），并把它当作一轮，先输出一个 0 token、没有文字的「成功」结果；然后才在同一个进程里回答新的问题，再输出真正的结果。服务原来读到第一个结果就不再读了，于是报「没有可解析的输出」，要再发一条才恢复。现在续接时读到这种空结果，就接着读同一个进程，等真正的结果，不重新调用模型；`<synthetic>` 的合成回复也不算回答。接着读的时候 300 秒没有任何输出就停。兜底：这一轮什么都没产出时，先用同一个会话再试一次，还是空就去掉 `--resume` 新开会话，一次请求最多起三次 CLI。只有这一轮什么都没输出（没有文字、没有工具调用和工具结果）时才会读下去或重试，调用方不会收到重复内容。
+- **`CLAUDE_CONFIG_DIR=/home/appuser/.claude`**（ak4 起）：Claude Code 的全局配置 `.claude.json` 原来写在 `$HOME` 下，不在挂载的 `~/.claude` 里，容器一重建就丢，项目信任、MCP 批准之类每次都清零。设了这个变量以后，它就落在 `~/.claude/.claude.json`。用户级 `settings.json`、会话记录和技能本来就在这个目录，位置不变。
+- **版本号** `0.1.14+ak4`：`+akN` 是本 fork 的修订号。ak1 是第一版，钉住 Claude Code、Node 和 npm 组件的版本；ak2 加了 Debian 包版本钉和 SSH 配置挂点；ak3 加了 tini；ak4 修了强制取消后的续接，加了 `CLAUDE_CONFIG_DIR`。
 - **测试工作流**（`.github/workflows/test.yml`）：e2e 任务的 Node 换成 22，pnpm 钉在 10.33.0。原来用的 `latest`（11 以上）装这份锁文件会报 `ERR_PNPM_IGNORED_BUILDS`。
-- **发布工作流**（`.github/workflows/publish.yml`）：只构建 linux/amd64，推到 `ghcr.io/akiyo-dayo/nekro-cc-sandbox`。标签形如 `0.1.14-ak3-cc2.1.311`，发布后不覆盖，也不发 `latest`。推送前先启动容器做冒烟检查，检查各组件版本、SSH 配置挂点，以及孤儿进程退出后有没有留下僵尸；只用内置的 `GITHUB_TOKEN`。
+- **发布工作流**（`.github/workflows/publish.yml`）：只构建 linux/amd64，推到 `ghcr.io/akiyo-dayo/nekro-cc-sandbox`。标签形如 `0.1.14-ak4-cc2.1.311`，发布后不覆盖，也不发 `latest`。推送前先启动容器做冒烟检查，检查各组件版本、SSH 配置挂点、孤儿进程退出后有没有留下僵尸。ak4 起，冒烟检查还会接一个假的 Anthropic 接口（`.github/smoke/fake_anthropic.py`，放在单独的 docker 网络里），让真的 Claude Code 在已有的会话里起一个后台 `sleep 300`，在下一次模型请求挂着的时候强制取消，紧接着再发一条，要求这一条拿到回复，而且日志里确实走到了「读过空结果」这条路径；同时检查 `.claude.json` 落在 `~/.claude` 里。只用内置的 `GITHUB_TOKEN`。
 
 升级 Claude Code：改 Dockerfile 里的 `ARG CLAUDE_CODE_VERSION`（其他内容也变了的话，把 `+akN` 加一），提交后手动运行 “Release Docker Image” 工作流，或推送 `v<镜像标签>` 形式的 git 标签。
 

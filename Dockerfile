@@ -137,6 +137,13 @@ RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
 # The CLI must never replace itself at runtime: the image tag is the version.
 ENV DISABLE_AUTOUPDATER=1
 
+# Keep Claude Code's global state in the per-workspace ~/.claude volume. Without this the CLI
+# writes ~/.claude.json directly in $HOME, which is not mounted, so every container rebuild
+# loses project trust, MCP approvals and the like (and the CLI warns about a missing config).
+# It is the directory the CLI already uses for settings.json, sessions and skills; only
+# .claude.json moves into it.
+ENV CLAUDE_CONFIG_DIR=/home/appuser/.claude
+
 # Make claude available on PATH for all users (npm global bin is already in PATH,
 # but keep the fallback copy in case of non-standard install paths)
 RUN if [ ! -x /usr/local/bin/claude ] && [ -x /root/.local/bin/claude ]; then \
